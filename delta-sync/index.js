@@ -523,6 +523,41 @@ async function parseSaveRequest(input, init) {
 }
 
 /**
+ * Per-chat serial queue. Each entry is the tail of a promise chain; new saves
+ * `.then()` off it so two saves to the same chat never run concurrently.
+ * Without this, ST's streaming generation fires saves faster than the round-
+ * trip — the second one diffs against an unchanged cache, sends overlapping
+ * ops, and the server 409s on baseHash. The retry path recovers correctness
+ * but every overlap costs an extra round-trip and a /state refetch.
+ *
+ * The chain awaits each task via `.catch(() => {})` so one failure doesn't
+ * poison the queue: subsequent saves still run.
+ *
+ * @type {Map<string, Promise<any>>}
+ */
+const saveQueues = new Map();
+
+/**
+ * Append a save task to the per-key serial queue and return its promise.
+ * @template T
+ * @param {string} cacheKey
+ * @param {() => Promise<T>} task
+ * @returns {Promise<T>}
+ */
+function enqueueSave(cacheKey, task) {
+    const prev = saveQueues.get(cacheKey) || Promise.resolve();
+    const next = prev.catch(() => {}).then(task);
+    saveQueues.set(cacheKey, next);
+    next.finally(() => {
+        // Only clean up if no newer task has been appended since.
+        if (saveQueues.get(cacheKey) === next) {
+            saveQueues.delete(cacheKey);
+        }
+    });
+    return next;
+}
+
+/**
  * Wrapped fetch that intercepts chat saves.
  * @param  {Parameters<typeof window.fetch>} args
  * @returns {Promise<Response>}
@@ -540,15 +575,15 @@ async function interceptedFetch(...args) {
         return originalFetch(input, init);
     }
 
-    // Try delta sync
-    const deltaResult = await tryDeltaSync(parsed.chatFile, parsed.isGroupChat, parsed.lines, parsed.force);
-    if (deltaResult) {
-        return deltaResult;
-    }
-
-    // Fall back to original save
-    console.debug('[delta-sync] Falling back to original save');
-    return originalFetch(input, init);
+    const cacheKey = `${parsed.isGroupChat ? 'g:' : 'c:'}${parsed.chatFile}`;
+    return enqueueSave(cacheKey, async () => {
+        const deltaResult = await tryDeltaSync(parsed.chatFile, parsed.isGroupChat, parsed.lines, parsed.force);
+        if (deltaResult) {
+            return deltaResult;
+        }
+        console.debug('[delta-sync] Falling back to original save');
+        return originalFetch(input, init);
+    });
 }
 
 // ---- Extension lifecycle ----
