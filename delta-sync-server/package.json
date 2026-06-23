@@ -1,0 +1,7 @@
+{
+  "name": "st-delta-sync",
+  "version": "1.0.0",
+  "description": "Delta-sync plugin for SillyTavern — differential chat saves",
+  "main": "index.mjs",
+  "type": "module"
+}

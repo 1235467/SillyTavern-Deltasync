@@ -1,0 +1,13 @@
+{
+    "display_name": "Delta Sync",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "delta-sync",
+    "version": "1.0.0",
+    "homePage": "",
+    "hooks": {
+        "activate": "init"
+    }
+}
