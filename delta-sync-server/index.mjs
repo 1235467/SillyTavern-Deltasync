@@ -227,5 +227,5 @@ export async function init(router) {
         }
     });
 
-    console.log('[delta-sync] Plugin initialized — routes: /state, /sync, /full-save');
+    console.log('[delta-sync] Plugin initialized — routes: /ping, /state, /sync, /full-save');
 }
