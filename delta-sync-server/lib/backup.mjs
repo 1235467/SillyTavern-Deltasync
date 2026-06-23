@@ -56,22 +56,26 @@ function writeBackup(backupDir, chatName, data) {
     removeOldBackups(backupDir, `${BACKUP_PREFIX}${safeName}_`);
 }
 
-/** @type {Map<string, number>} Last backup time per user handle */
+/** @type {Map<string, number>} Last backup time keyed by handle:chatName */
 const lastBackupTime = new Map();
 
 /**
- * Throttled backup: at most once per THROTTLE_MS per user handle.
- * @param {string} handle  User handle (throttle key)
+ * Throttled backup: at most once per THROTTLE_MS per (handle, chat) pair.
+ * Keying per-chat is important — a per-handle key meant that chatting with
+ * two characters within the throttle window dropped one's backups entirely.
+ *
+ * @param {string} handle  User handle
  * @param {string} backupDir  User's backup directory
  * @param {string} chatName  Chat identifier for the backup filename
  * @param {string} data  Serialized JSONL content
  */
 export function throttledBackup(handle, backupDir, chatName, data) {
     const now = Date.now();
-    const last = lastBackupTime.get(handle) || 0;
+    const key = `${handle}:${chatName}`;
+    const last = lastBackupTime.get(key) || 0;
     if (now - last < THROTTLE_MS) return;
 
-    lastBackupTime.set(handle, now);
+    lastBackupTime.set(key, now);
     try {
         writeBackup(backupDir, chatName, data);
     } catch (err) {

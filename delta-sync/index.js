@@ -87,7 +87,9 @@ async function fetchState(chatFile, isGroupChat) {
  * Assumes inputs are pre-trimmed of common prefix/suffix; the `offset` is added
  * back to every emitted index.
  *
- * Memory: Uint16Array of (m+1)*(n+1). Callers must enforce the size cap.
+ * Memory: Uint32Array of (m+1)*(n+1). Uint16 would silently wrap at 65535;
+ * Uint32 costs 4x but is bounded by MAX_DIFF_LINES (~36MB at the cap) and
+ * eliminates the overflow class of bugs entirely. Callers must enforce the cap.
  * @param {string[]} oldMid
  * @param {string[]} newMidHashes
  * @param {string[]} newMidLines
@@ -116,7 +118,7 @@ function lcsDiff(oldMid, newMidHashes, newMidLines, offset) {
     }
 
     const w = n + 1;
-    const dp = new Uint16Array((m + 1) * w);
+    const dp = new Uint32Array((m + 1) * w);
     for (let i = 1; i <= m; i++) {
         const rowBase = i * w;
         const prevBase = (i - 1) * w;

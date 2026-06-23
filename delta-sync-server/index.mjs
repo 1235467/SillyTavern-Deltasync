@@ -25,16 +25,39 @@ function readChatLines(filePath) {
 }
 
 /**
- * Write lines back to a JSONL file atomically.
+ * Atomically write a chat file. Writes to a sibling tmp file, fsyncs it, then
+ * renames over the target — on POSIX rename(2) is atomic on the same filesystem,
+ * so a crash mid-write can never leave a truncated chat file. The tmp file is
+ * unlinked on any error path.
+ *
  * @param {string} filePath
- * @param {string[]} lines
+ * @param {string} data  Full file body
  */
-function writeChatLines(filePath, lines) {
+function writeChatFileAtomic(filePath, data) {
     const dir = path.dirname(filePath);
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(filePath, lines.join('\n'), 'utf8');
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    let fd;
+    try {
+        fd = fs.openSync(tmpPath, 'w');
+        fs.writeSync(fd, data, 0, 'utf8');
+        fs.fsyncSync(fd);
+        fs.closeSync(fd);
+        fd = undefined;
+        fs.renameSync(tmpPath, filePath);
+    } catch (err) {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch { /* ignore */ }
+        }
+        try { fs.unlinkSync(tmpPath); } catch { /* tmp may not exist */ }
+        throw err;
+    }
+}
+
+function writeChatLines(filePath, lines) {
+    writeChatFileAtomic(filePath, lines.join('\n'));
 }
 
 /**
@@ -216,12 +239,7 @@ export async function init(router) {
                 }
             }
 
-            // Write file
-            const dir = path.dirname(filePath);
-            if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-            }
-            fs.writeFileSync(filePath, data, 'utf8');
+            writeChatFileAtomic(filePath, data);
 
             const lines = data.split('\n');
             const hash = hashLines(lines);
