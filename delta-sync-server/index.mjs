@@ -77,11 +77,13 @@ export async function init(router) {
 
             const hashes = lines.map(line => hashLine(line));
             const integrity = getIntegrity(lines[0]);
+            const fileHash = hashLines(lines);
 
             return res.json({
                 ok: true,
                 lines: lines.length,
                 hashes,
+                fileHash,
                 integrity: integrity || null,
             });
         } catch (err) {
@@ -93,10 +95,20 @@ export async function init(router) {
     // POST /sync — apply diff operations
     router.post('/sync', (req, res) => {
         try {
-            const { chatFile, isGroupChat, integrity, ops, expectedHash } = req.body;
+            const { chatFile, isGroupChat, baseHash, ops, expectedHash } = req.body;
             const { filePath, error } = resolveChatPath(chatFile, !!isGroupChat, req.user.directories);
             if (error) {
                 return res.status(400).json({ ok: false, error });
+            }
+
+            // baseHash + expectedHash are MANDATORY. Without them, a stale
+            // client could apply a diff to a file that has been modified
+            // out-of-band, producing silent corruption. Reject loudly.
+            if (typeof baseHash !== 'string' || baseHash.length === 0) {
+                return res.status(400).json({ ok: false, error: 'baseHash is required' });
+            }
+            if (typeof expectedHash !== 'string' || expectedHash.length === 0) {
+                return res.status(400).json({ ok: false, error: 'expectedHash is required' });
             }
 
             const lines = readChatLines(filePath);
@@ -104,29 +116,32 @@ export async function init(router) {
                 return res.status(404).json({ ok: false, error: 'Chat file not found' });
             }
 
-            // Integrity check: compare provided integrity against file's header
-            const fileIntegrity = getIntegrity(lines[0]);
-            if (fileIntegrity && integrity !== fileIntegrity) {
-                return res.status(409).json({
-                    ok: false,
-                    error: 'Integrity mismatch — file has been modified',
-                    expected: integrity,
-                    actual: fileIntegrity,
-                });
-            }
-
-            // Validate ops
+            // Validate ops shape before doing anything expensive
             const validation = validateOps(ops, lines.length);
             if (validation.error) {
                 return res.status(400).json({ ok: false, error: validation.error });
             }
 
+            // Pre-apply guard: the on-disk file MUST match the base the client
+            // computed its diff against. If not, the client's cache is stale —
+            // refuse and let it refetch /state.
+            const diskHash = hashLines(lines);
+            if (diskHash !== baseHash) {
+                return res.status(409).json({
+                    ok: false,
+                    error: 'baseHash mismatch — file changed since client read state',
+                    expected: baseHash,
+                    actual: diskHash,
+                });
+            }
+
             // Apply ops to a copy of lines
             const result = applyOps([...lines], ops);
 
-            // Verify expected hash
+            // Post-apply guard: result must match what the client expects.
+            // If baseHash matched but this fails, ops are malformed or buggy.
             const actualHash = hashLines(result);
-            if (expectedHash && expectedHash !== actualHash) {
+            if (expectedHash !== actualHash) {
                 return res.status(409).json({
                     ok: false,
                     error: 'Hash mismatch after applying ops — file not modified',
@@ -160,7 +175,7 @@ export async function init(router) {
     // POST /full-save — fallback full file write
     router.post('/full-save', (req, res) => {
         try {
-            const { chatFile, isGroupChat, content, chat, force } = req.body;
+            const { chatFile, isGroupChat, content, chat, force, previousHash } = req.body;
             const { filePath, error } = resolveChatPath(chatFile, !!isGroupChat, req.user.directories);
             if (error) {
                 return res.status(400).json({ ok: false, error });
@@ -177,23 +192,26 @@ export async function init(router) {
                 return res.status(400).json({ ok: false, error: 'Either "content" (string) or "chat" (array) is required' });
             }
 
-            // Integrity check (unless force=true)
+            // Concurrency guard (unless force=true): the on-disk file must still
+            // match what the client last saw. If the file existed but the client
+            // didn't send previousHash, we have no way to verify — reject.
             if (!force) {
                 const existingLines = readChatLines(filePath);
-                if (existingLines !== null && existingLines.length > 0) {
-                    const existingIntegrity = getIntegrity(existingLines[0]);
-                    if (existingIntegrity) {
-                        // Extract integrity from the incoming data's first line
-                        const firstLine = data.split('\n')[0];
-                        const incomingIntegrity = getIntegrity(firstLine);
-                        if (incomingIntegrity && existingIntegrity !== incomingIntegrity) {
-                            return res.status(409).json({
-                                ok: false,
-                                error: 'Integrity mismatch — file has been modified externally',
-                                expected: incomingIntegrity,
-                                actual: existingIntegrity,
-                            });
-                        }
+                if (existingLines !== null) {
+                    if (typeof previousHash !== 'string' || previousHash.length === 0) {
+                        return res.status(400).json({
+                            ok: false,
+                            error: 'previousHash is required for non-force full-save when file exists',
+                        });
+                    }
+                    const diskHash = hashLines(existingLines);
+                    if (diskHash !== previousHash) {
+                        return res.status(409).json({
+                            ok: false,
+                            error: 'previousHash mismatch — file changed since client read state',
+                            expected: previousHash,
+                            actual: diskHash,
+                        });
                     }
                 }
             }

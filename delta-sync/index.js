@@ -23,8 +23,11 @@ async function hashLines(lines) {
 }
 
 /**
- * Per-file state cache: last known hashes and lines.
- * @type {Map<string, { hashes: string[], integrity: string|null }>}
+ * Per-file state cache. `hashes` is the per-line hash array used by the diff
+ * algorithm; `fileHash` is the hash of the whole file (joined with '\n') and
+ * is sent as `baseHash` to the server so it can pre-validate that its on-disk
+ * state still matches what we computed the diff against.
+ * @type {Map<string, { hashes: string[], fileHash: string }>}
  */
 const stateCache = new Map();
 
@@ -62,7 +65,7 @@ function getAuthHeaders() {
  * Fetch the server's current state for a chat file.
  * @param {string} chatFile
  * @param {boolean} isGroupChat
- * @returns {Promise<{ok: boolean, hashes?: string[], integrity?: string|null, lines?: number}|null>}
+ * @returns {Promise<{ok: boolean, hashes?: string[], fileHash?: string, integrity?: string|null, lines?: number}|null>}
  */
 async function fetchState(chatFile, isGroupChat) {
     try {
@@ -201,90 +204,46 @@ async function computeDiff(oldHashes, newLines) {
 }
 
 /**
- * Attempt a delta sync for a chat save.
+ * Attempt a delta sync for a chat save. Performs one auto-retry on 409
+ * (stale cache) by refetching /state before falling back to /full-save.
+ *
  * @param {string} chatFile  Relative chat file path
  * @param {boolean} isGroupChat
  * @param {string[]} newLines  The new JSONL lines being saved
- * @param {boolean} force  Force overwrite (skip integrity)
- * @returns {Promise<Response|null>}  A fake ok Response if delta succeeded, or null to fall back.
+ * @param {boolean} force  Force overwrite (bypass concurrency checks)
+ * @returns {Promise<Response|null>}  A fake ok Response on success, null to fall back to the original ST save.
  */
 async function tryDeltaSync(chatFile, isGroupChat, newLines, force) {
     try {
-        // Force overwrite skips the integrity check entirely. /sync has no force
-        // semantics (it always compares integrity), so route force saves to /full-save.
+        // Force = unconditional overwrite. /sync always validates baseHash, so
+        // force has no meaning there — route force saves to /full-save.
         if (force) {
             return await tryFullSave(chatFile, isGroupChat, newLines, true);
         }
 
-        // Get cached or fresh server state
         const cacheKey = `${isGroupChat ? 'g:' : 'c:'}${chatFile}`;
-        let state = stateCache.get(cacheKey);
 
-        if (!state) {
-            const fetched = await fetchState(chatFile, isGroupChat);
-            if (!fetched || !fetched.ok) return null;
-            state = { hashes: fetched.hashes, integrity: fetched.integrity };
-            stateCache.set(cacheKey, state);
-        }
-
-        // Compute diff. null means "too large to diff cheaply" — full-save instead.
-        const diff = await computeDiff(state.hashes, newLines);
-        if (diff === null) {
-            console.debug('[delta-sync] Diff window too large, using full-save');
+        // First attempt with whatever's in cache (may trigger a /state fetch).
+        let result = await attemptSyncOnce(cacheKey, chatFile, isGroupChat, newLines);
+        if (result.kind === 'ok') return result.response;
+        if (result.kind === 'fallback') {
             return await tryFullSave(chatFile, isGroupChat, newLines, false);
         }
 
-        if (diff.ops.length === 0) {
-            // No changes — return success without hitting the server
-            console.debug('[delta-sync] No changes detected, skipping save');
-            return new Response(JSON.stringify({ ok: true }), {
-                status: 200,
-                headers: { 'Content-Type': 'application/json' },
-            });
-        }
-
-        // If diff is larger than 70% of the file, full-save is probably cheaper
-        const totalLines = newLines.length;
-        if (diff.ops.length > totalLines * 0.7) {
-            console.debug(`[delta-sync] Diff too large (${diff.ops.length}/${totalLines}), using full-save`);
+        // result.kind === 'conflict' — refetch state and retry once.
+        console.warn('[delta-sync] Conflict on sync, refetching state and retrying');
+        stateCache.delete(cacheKey);
+        result = await attemptSyncOnce(cacheKey, chatFile, isGroupChat, newLines);
+        if (result.kind === 'ok') return result.response;
+        if (result.kind === 'fallback') {
             return await tryFullSave(chatFile, isGroupChat, newLines, false);
         }
 
-        // Send sync request
-        const syncResp = await originalFetch(`${PLUGIN_BASE}/sync`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-            body: JSON.stringify({
-                chatFile,
-                isGroupChat,
-                integrity: state.integrity,
-                ops: diff.ops,
-                expectedHash: diff.expectedHash,
-            }),
-        });
-
-        if (syncResp.ok) {
-            // Update cache with new state
-            const newHashes = await Promise.all(newLines.map(l => hashLine(l)));
-            const newIntegrity = getIntegrityFromLine(newLines[0]);
-            stateCache.set(cacheKey, { hashes: newHashes, integrity: newIntegrity });
-
-            console.debug(`[delta-sync] Synced ${diff.ops.length} ops for ${chatFile}`);
-            return new Response(JSON.stringify({ ok: true }), {
-                status: 200,
-                headers: { 'Content-Type': 'application/json' },
-            });
-        }
-
-        // 409 = integrity or hash mismatch — invalidate cache and fall back
-        if (syncResp.status === 409) {
-            console.warn('[delta-sync] Conflict on sync, invalidating cache');
-            stateCache.delete(cacheKey);
-            return null;
-        }
-
-        console.warn('[delta-sync] Sync failed with status', syncResp.status);
-        return null;
+        // Still conflicting after fresh state — give up on delta and do a guarded
+        // full-save. Use the just-fetched fileHash as previousHash so we still
+        // refuse to clobber concurrent changes.
+        console.warn('[delta-sync] Conflict persists after retry, falling back to full-save');
+        return await tryFullSave(chatFile, isGroupChat, newLines, false);
     } catch (err) {
         console.error('[delta-sync] Error during delta sync:', err);
         return null;
@@ -292,7 +251,85 @@ async function tryDeltaSync(chatFile, isGroupChat, newLines, force) {
 }
 
 /**
- * Full save via plugin endpoint (bypasses gzip compression overhead of the normal path).
+ * One pass at delta-syncing. Returns a discriminated result so the caller can
+ * decide whether to retry, full-save, or accept success.
+ *
+ * @param {string} cacheKey
+ * @param {string} chatFile
+ * @param {boolean} isGroupChat
+ * @param {string[]} newLines
+ * @returns {Promise<{kind:'ok', response: Response} | {kind:'conflict'} | {kind:'fallback'}>}
+ */
+async function attemptSyncOnce(cacheKey, chatFile, isGroupChat, newLines) {
+    let state = stateCache.get(cacheKey);
+    if (!state) {
+        const fetched = await fetchState(chatFile, isGroupChat);
+        if (!fetched || !fetched.ok) return { kind: 'fallback' };
+        state = { hashes: fetched.hashes, fileHash: fetched.fileHash };
+        stateCache.set(cacheKey, state);
+    }
+
+    const diff = await computeDiff(state.hashes, newLines);
+    if (diff === null) {
+        console.debug('[delta-sync] Diff window too large, using full-save');
+        return { kind: 'fallback' };
+    }
+
+    if (diff.ops.length === 0) {
+        console.debug('[delta-sync] No changes detected, skipping save');
+        return {
+            kind: 'ok',
+            response: new Response(JSON.stringify({ ok: true }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            }),
+        };
+    }
+
+    const totalLines = newLines.length;
+    if (diff.ops.length > totalLines * 0.7) {
+        console.debug(`[delta-sync] Diff too large (${diff.ops.length}/${totalLines}), using full-save`);
+        return { kind: 'fallback' };
+    }
+
+    const syncResp = await originalFetch(`${PLUGIN_BASE}/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({
+            chatFile,
+            isGroupChat,
+            baseHash: state.fileHash,
+            ops: diff.ops,
+            expectedHash: diff.expectedHash,
+        }),
+    });
+
+    if (syncResp.ok) {
+        const newHashes = await Promise.all(newLines.map(l => hashLine(l)));
+        stateCache.set(cacheKey, { hashes: newHashes, fileHash: diff.expectedHash });
+        console.debug(`[delta-sync] Synced ${diff.ops.length} ops for ${chatFile}`);
+        return {
+            kind: 'ok',
+            response: new Response(JSON.stringify({ ok: true }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            }),
+        };
+    }
+
+    if (syncResp.status === 409) {
+        return { kind: 'conflict' };
+    }
+
+    console.warn('[delta-sync] Sync failed with status', syncResp.status);
+    return { kind: 'fallback' };
+}
+
+/**
+ * Full save via plugin endpoint. When force=false, sends previousHash so the
+ * server refuses to clobber concurrent changes; on 409 the cache is dropped
+ * and the call returns null (caller falls back to ST's original /save).
+ *
  * @param {string} chatFile
  * @param {boolean} isGroupChat
  * @param {string[]} newLines
@@ -301,22 +338,42 @@ async function tryDeltaSync(chatFile, isGroupChat, newLines, force) {
  */
 async function tryFullSave(chatFile, isGroupChat, newLines, force) {
     try {
+        const cacheKey = `${isGroupChat ? 'g:' : 'c:'}${chatFile}`;
+
+        // When not forcing, the server demands previousHash if the file exists.
+        // Populate the cache from /state if we don't have it yet, so we never
+        // accidentally clobber concurrent writes.
+        let cached = stateCache.get(cacheKey);
+        if (!force && !cached) {
+            const fetched = await fetchState(chatFile, isGroupChat);
+            if (fetched?.ok) {
+                cached = { hashes: fetched.hashes, fileHash: fetched.fileHash };
+                stateCache.set(cacheKey, cached);
+            }
+            // If /state returned 404, the file genuinely doesn't exist —
+            // server will skip previousHash check and accept the write.
+        }
+
+        const body = {
+            chatFile,
+            isGroupChat,
+            content: newLines.join('\n'),
+            force: !!force,
+        };
+        if (!force && cached?.fileHash) {
+            body.previousHash = cached.fileHash;
+        }
+
         const resp = await originalFetch(`${PLUGIN_BASE}/full-save`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-            body: JSON.stringify({
-                chatFile,
-                isGroupChat,
-                content: newLines.join('\n'),
-                force: !!force,
-            }),
+            body: JSON.stringify(body),
         });
 
         if (resp.ok) {
-            const cacheKey = `${isGroupChat ? 'g:' : 'c:'}${chatFile}`;
             const newHashes = await Promise.all(newLines.map(l => hashLine(l)));
-            const newIntegrity = getIntegrityFromLine(newLines[0]);
-            stateCache.set(cacheKey, { hashes: newHashes, integrity: newIntegrity });
+            const newFileHash = await hashLines(newLines);
+            stateCache.set(cacheKey, { hashes: newHashes, fileHash: newFileHash });
             console.debug(`[delta-sync] Full-save for ${chatFile}`);
             return new Response(JSON.stringify({ ok: true }), {
                 status: 200,
@@ -324,22 +381,18 @@ async function tryFullSave(chatFile, isGroupChat, newLines, force) {
             });
         }
 
+        if (resp.status === 409) {
+            // Stale cache: drop it so the next save refetches /state. Returning
+            // null lets the caller fall back to ST's native save, which is the
+            // safe thing — we explicitly don't want to silently overwrite.
+            console.warn('[delta-sync] Full-save conflict, dropping cache');
+            stateCache.delete(cacheKey);
+        } else {
+            console.warn('[delta-sync] Full-save failed with status', resp.status);
+        }
         return null;
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Extract integrity UUID from a header line JSON string.
- * @param {string} line
- * @returns {string|null}
- */
-function getIntegrityFromLine(line) {
-    try {
-        const parsed = JSON.parse(line);
-        return parsed?.chat_metadata?.integrity || null;
-    } catch {
+    } catch (err) {
+        console.error('[delta-sync] Error during full-save:', err);
         return null;
     }
 }
