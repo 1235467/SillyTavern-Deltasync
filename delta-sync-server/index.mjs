@@ -55,6 +55,12 @@ function getIntegrity(headerLine) {
  * @param {import('express').Router} router
  */
 export async function init(router) {
+    // GET /ping — liveness probe used by the client extension to detect that
+    // the server plugin is loaded. A bare 404 (route missing) means "not loaded".
+    router.get('/ping', (_req, res) => {
+        return res.json({ ok: true, plugin: 'delta-sync' });
+    });
+
     // POST /state — return per-line hashes
     router.post('/state', (req, res) => {
         try {

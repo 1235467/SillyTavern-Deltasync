@@ -1,4 +1,4 @@
-import { getContext } from '../../extensions.js';
+import { getContext } from '../../../extensions.js';
 
 const PLUGIN_BASE = '/api/plugins/delta-sync';
 /**
@@ -34,13 +34,13 @@ const stateCache = new Map();
  */
 async function isPluginAvailable() {
     try {
-        const resp = await originalFetch(`${PLUGIN_BASE}/state`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-            body: JSON.stringify({ chatFile: '__probe__', isGroupChat: false }),
+        const resp = await originalFetch(`${PLUGIN_BASE}/ping`, {
+            method: 'GET',
+            headers: { ...getAuthHeaders() },
         });
-        // 400 = plugin is there, just rejected the path. 404 on route = plugin not loaded.
-        return resp.status === 400;
+        if (!resp.ok) return false;
+        const data = await resp.json().catch(() => null);
+        return data?.ok === true && data?.plugin === 'delta-sync';
     } catch {
         return false;
     }
@@ -79,45 +79,124 @@ async function fetchState(chatFile, isGroupChat) {
 }
 
 /**
+ * LCS between two hash arrays. Returns the ops list (insert + delete only)
+ * with indices in the original (delete) / final (insert) coordinate systems.
+ * Assumes inputs are pre-trimmed of common prefix/suffix; the `offset` is added
+ * back to every emitted index.
+ *
+ * Memory: Uint16Array of (m+1)*(n+1). Callers must enforce the size cap.
+ * @param {string[]} oldMid
+ * @param {string[]} newMidHashes
+ * @param {string[]} newMidLines
+ * @param {number} offset  Number of common-prefix lines stripped from the front
+ * @returns {Array<{type: string, index: number, content?: string}>}
+ */
+function lcsDiff(oldMid, newMidHashes, newMidLines, offset) {
+    const m = oldMid.length;
+    const n = newMidHashes.length;
+    if (m === 0 && n === 0) return [];
+    if (m === 0) {
+        // Pure insertion
+        const ops = [];
+        for (let j = 0; j < n; j++) {
+            ops.push({ type: 'insert', index: offset + j, content: newMidLines[j] });
+        }
+        return ops;
+    }
+    if (n === 0) {
+        // Pure deletion
+        const ops = [];
+        for (let i = 0; i < m; i++) {
+            ops.push({ type: 'delete', index: offset + i });
+        }
+        return ops;
+    }
+
+    const w = n + 1;
+    const dp = new Uint16Array((m + 1) * w);
+    for (let i = 1; i <= m; i++) {
+        const rowBase = i * w;
+        const prevBase = (i - 1) * w;
+        const oh = oldMid[i - 1];
+        for (let j = 1; j <= n; j++) {
+            if (oh === newMidHashes[j - 1]) {
+                dp[rowBase + j] = dp[prevBase + (j - 1)] + 1;
+            } else {
+                const up = dp[prevBase + j];
+                const left = dp[rowBase + (j - 1)];
+                dp[rowBase + j] = up >= left ? up : left;
+            }
+        }
+    }
+
+    const ops = [];
+    let i = m, j = n;
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && oldMid[i - 1] === newMidHashes[j - 1]) {
+            i--; j--;
+        } else if (j > 0 && (i === 0 || dp[i * w + (j - 1)] >= dp[(i - 1) * w + j])) {
+            ops.push({ type: 'insert', index: offset + j - 1, content: newMidLines[j - 1] });
+            j--;
+        } else {
+            ops.push({ type: 'delete', index: offset + i - 1 });
+            i--;
+        }
+    }
+    return ops;
+}
+
+const MAX_DIFF_LINES = 3000;
+
+/**
  * Compute diff operations between old hashes and new lines.
+ * Strips common prefix/suffix first so typical edits (append, single-block
+ * change) reduce to a tiny LCS. Returns null if the residual middle exceeds
+ * MAX_DIFF_LINES on either side — caller should fall back to a full save.
+ *
  * @param {string[]} oldHashes Server's per-line hashes
  * @param {string[]} newLines Client's new lines
  * @returns {Promise<{ops: Array<{type: string, index: number, content?: string}>, expectedHash: string}|null>}
  */
 async function computeDiff(oldHashes, newLines) {
-    const ops = [];
     const newHashes = await Promise.all(newLines.map(l => hashLine(l)));
+    const expectedHash = await hashLines(newLines);
 
-    // Use a simple alignment: compare by position, then handle length changes.
-    const minLen = Math.min(oldHashes.length, newLines.length);
+    const m0 = oldHashes.length;
+    const n0 = newHashes.length;
 
-    // Modifications: lines that exist in both but differ
-    for (let i = 0; i < minLen; i++) {
-        if (oldHashes[i] !== newHashes[i]) {
-            ops.push({ type: 'modify', index: i, content: newLines[i] });
-        }
+    // Trim common prefix
+    let prefix = 0;
+    const prefixMax = Math.min(m0, n0);
+    while (prefix < prefixMax && oldHashes[prefix] === newHashes[prefix]) {
+        prefix++;
     }
 
-    // Deletions: old file was longer (lines from the end removed)
-    if (oldHashes.length > newLines.length) {
-        for (let i = oldHashes.length - 1; i >= minLen; i--) {
-            ops.push({ type: 'delete', index: i });
-        }
+    // Trim common suffix (without overlapping the prefix on either side)
+    let suffix = 0;
+    const suffixMax = Math.min(m0 - prefix, n0 - prefix);
+    while (
+        suffix < suffixMax &&
+        oldHashes[m0 - 1 - suffix] === newHashes[n0 - 1 - suffix]
+    ) {
+        suffix++;
     }
 
-    // Insertions: new file is longer (lines appended)
-    if (newLines.length > oldHashes.length) {
-        for (let i = oldHashes.length; i < newLines.length; i++) {
-            ops.push({ type: 'insert', index: i, content: newLines[i] });
-        }
+    const midOldLen = m0 - prefix - suffix;
+    const midNewLen = n0 - prefix - suffix;
+
+    if (midOldLen === 0 && midNewLen === 0) {
+        return { ops: [], expectedHash };
     }
 
-    if (ops.length === 0) {
-        // No changes — skip the save entirely
+    if (midOldLen > MAX_DIFF_LINES || midNewLen > MAX_DIFF_LINES) {
         return null;
     }
 
-    const expectedHash = await hashLines(newLines);
+    const oldMid = oldHashes.slice(prefix, m0 - suffix);
+    const newMidHashes = newHashes.slice(prefix, n0 - suffix);
+    const newMidLines = newLines.slice(prefix, n0 - suffix);
+
+    const ops = lcsDiff(oldMid, newMidHashes, newMidLines, prefix);
     return { ops, expectedHash };
 }
 
@@ -131,6 +210,12 @@ async function computeDiff(oldHashes, newLines) {
  */
 async function tryDeltaSync(chatFile, isGroupChat, newLines, force) {
     try {
+        // Force overwrite skips the integrity check entirely. /sync has no force
+        // semantics (it always compares integrity), so route force saves to /full-save.
+        if (force) {
+            return await tryFullSave(chatFile, isGroupChat, newLines, true);
+        }
+
         // Get cached or fresh server state
         const cacheKey = `${isGroupChat ? 'g:' : 'c:'}${chatFile}`;
         let state = stateCache.get(cacheKey);
@@ -142,9 +227,14 @@ async function tryDeltaSync(chatFile, isGroupChat, newLines, force) {
             stateCache.set(cacheKey, state);
         }
 
-        // Compute diff
+        // Compute diff. null means "too large to diff cheaply" — full-save instead.
         const diff = await computeDiff(state.hashes, newLines);
         if (diff === null) {
+            console.debug('[delta-sync] Diff window too large, using full-save');
+            return await tryFullSave(chatFile, isGroupChat, newLines, false);
+        }
+
+        if (diff.ops.length === 0) {
             // No changes — return success without hitting the server
             console.debug('[delta-sync] No changes detected, skipping save');
             return new Response(JSON.stringify({ ok: true }), {
@@ -157,7 +247,7 @@ async function tryDeltaSync(chatFile, isGroupChat, newLines, force) {
         const totalLines = newLines.length;
         if (diff.ops.length > totalLines * 0.7) {
             console.debug(`[delta-sync] Diff too large (${diff.ops.length}/${totalLines}), using full-save`);
-            return await tryFullSave(chatFile, isGroupChat, newLines, force);
+            return await tryFullSave(chatFile, isGroupChat, newLines, false);
         }
 
         // Send sync request
@@ -167,7 +257,7 @@ async function tryDeltaSync(chatFile, isGroupChat, newLines, force) {
             body: JSON.stringify({
                 chatFile,
                 isGroupChat,
-                integrity: force ? undefined : state.integrity,
+                integrity: state.integrity,
                 ops: diff.ops,
                 expectedHash: diff.expectedHash,
             }),
@@ -314,7 +404,10 @@ function isGzipEncoded(headers) {
  * @returns {Promise<{ url: string, chatFile: string, isGroupChat: boolean, lines: string[], force: boolean } | null>}
  */
 async function parseSaveRequest(input, init) {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = typeof input === 'string'
+        ? input
+        : (input instanceof URL ? input.href : input?.url);
+    if (!url) return null;
 
     // Only intercept chat save endpoints
     const isCharSave = url.endsWith('/api/chats/save');
@@ -322,16 +415,31 @@ async function parseSaveRequest(input, init) {
     if (!isCharSave && !isGroupSave) return null;
 
     try {
-        const opts = init || (typeof input === 'object' ? input : {});
         let bodyStr;
+        let isGzip;
 
-        const rawBody = opts.body;
-        if (typeof rawBody === 'string') {
-            bodyStr = rawBody;
-        } else if ((rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer) && isGzipEncoded(opts.headers)) {
-            bodyStr = await decompressGzip(rawBody);
+        if (input instanceof Request) {
+            // ST currently never calls fetch with a Request, but guard anyway:
+            // a Request's body is a ReadableStream — clone before reading so the
+            // original can still be used in fallback.
+            const clone = input.clone();
+            isGzip = clone.headers.get('Content-Encoding') === 'gzip';
+            if (isGzip) {
+                bodyStr = await decompressGzip(await clone.arrayBuffer());
+            } else {
+                bodyStr = await clone.text();
+            }
         } else {
-            return null;
+            const opts = init || {};
+            const rawBody = opts.body;
+            isGzip = isGzipEncoded(opts.headers);
+            if (typeof rawBody === 'string') {
+                bodyStr = rawBody;
+            } else if ((rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer) && isGzip) {
+                bodyStr = await decompressGzip(rawBody);
+            } else {
+                return null;
+            }
         }
 
         const body = JSON.parse(bodyStr);

@@ -56,7 +56,17 @@ export function validateOps(ops, lineCount) {
 
 /**
  * Apply diff operations to an array of lines.
- * Order: deletes (high→low index), then modifies, then inserts (high→low index).
+ *
+ * Index conventions:
+ *   - delete.index: position in the ORIGINAL (pre-apply) array
+ *   - modify.index: position in the ORIGINAL array (must survive the delete pass)
+ *   - insert.index: position in the FINAL (post-apply) array
+ *
+ * Phase order:
+ *   1. deletes high→low (so earlier deletes don't shift later ones)
+ *   2. modifies — caller must not modify lines that are also deleted
+ *   3. inserts low→high (so each splice places content at its final-array position
+ *      in an array that already has every lower-index final line in place)
  *
  * @param {string[]} lines  Current file lines (mutated in place)
  * @param {Array<{type: string, index: number, content?: string}>} ops
@@ -65,19 +75,16 @@ export function validateOps(ops, lineCount) {
 export function applyOps(lines, ops) {
     const deletes = ops.filter(o => o.type === 'delete').sort((a, b) => b.index - a.index);
     const modifies = ops.filter(o => o.type === 'modify');
-    const inserts = ops.filter(o => o.type === 'insert').sort((a, b) => b.index - a.index);
+    const inserts = ops.filter(o => o.type === 'insert').sort((a, b) => a.index - b.index);
 
-    // Phase 1: deletes (high→low so indices stay valid)
     for (const op of deletes) {
         lines.splice(op.index, 1);
     }
 
-    // Phase 2: modifies (order doesn't matter, indices are independent)
     for (const op of modifies) {
         lines[op.index] = op.content;
     }
 
-    // Phase 3: inserts (high→low so indices stay valid)
     for (const op of inserts) {
         lines.splice(op.index, 0, op.content);
     }
