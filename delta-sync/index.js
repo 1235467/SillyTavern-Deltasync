@@ -26,10 +26,53 @@ async function hashLines(lines) {
  * Per-file state cache. `hashes` is the per-line hash array used by the diff
  * algorithm; `fileHash` is the hash of the whole file (joined with '\n') and
  * is sent as `baseHash` to the server so it can pre-validate that its on-disk
- * state still matches what we computed the diff against.
- * @type {Map<string, { hashes: string[], fileHash: string }>}
+ * state still matches what we computed the diff against. `lines` is the last
+ * known line content (when available) so unchanged indices can reuse hashes
+ * via string equality instead of re-SHA-256ing every save.
+ * @type {Map<string, { hashes: string[], fileHash: string, lines?: string[] }>}
  */
 const stateCache = new Map();
+
+/**
+ * Hash each line, reusing cached hashes when the line at the same index is
+ * byte-identical. Always recomputes `fileHash` over the full joined content so
+ * expectedHash remains a true whole-file digest (server-side integrity guard).
+ *
+ * @param {string[]} newLines
+ * @param {{ hashes?: string[], lines?: string[] }|null|undefined} cached
+ * @returns {Promise<{ hashes: string[], fileHash: string }>}
+ */
+async function hashNewLines(newLines, cached) {
+    const n = newLines.length;
+    const hashes = new Array(n);
+    /** @type {number[]} */
+    const pending = [];
+    const cachedLines = cached?.lines;
+    const cachedHashes = cached?.hashes;
+
+    for (let i = 0; i < n; i++) {
+        if (
+            cachedLines &&
+            cachedHashes &&
+            i < cachedLines.length &&
+            cachedLines[i] === newLines[i] &&
+            typeof cachedHashes[i] === 'string'
+        ) {
+            hashes[i] = cachedHashes[i];
+        } else {
+            pending.push(i);
+        }
+    }
+
+    if (pending.length > 0) {
+        await Promise.all(pending.map(async (i) => {
+            hashes[i] = await hashLine(newLines[i]);
+        }));
+    }
+
+    const fileHash = await hashLines(newLines);
+    return { hashes, fileHash };
+}
 
 /**
  * Check if the delta-sync server plugin is available.
@@ -158,13 +201,16 @@ const MAX_DIFF_LINES = 3000;
  * change) reduce to a tiny LCS. Returns null if the residual middle exceeds
  * MAX_DIFF_LINES on either side — caller should fall back to a full save.
  *
+ * Unchanged lines reuse hashes from `cached` (string equality at the same
+ * index). `expectedHash` is always a fresh whole-file digest.
+ *
  * @param {string[]} oldHashes Server's per-line hashes
  * @param {string[]} newLines Client's new lines
- * @returns {Promise<{ops: Array<{type: string, index: number, content?: string}>, expectedHash: string}|null>}
+ * @param {{ hashes?: string[], lines?: string[] }|null|undefined} cached
+ * @returns {Promise<{ops: Array<{type: string, index: number, content?: string}>, expectedHash: string, newHashes: string[]}|null>}
  */
-async function computeDiff(oldHashes, newLines) {
-    const newHashes = await Promise.all(newLines.map(l => hashLine(l)));
-    const expectedHash = await hashLines(newLines);
+async function computeDiff(oldHashes, newLines, cached) {
+    const { hashes: newHashes, fileHash: expectedHash } = await hashNewLines(newLines, cached);
 
     const m0 = oldHashes.length;
     const n0 = newHashes.length;
@@ -190,7 +236,7 @@ async function computeDiff(oldHashes, newLines) {
     const midNewLen = n0 - prefix - suffix;
 
     if (midOldLen === 0 && midNewLen === 0) {
-        return { ops: [], expectedHash };
+        return { ops: [], expectedHash, newHashes };
     }
 
     if (midOldLen > MAX_DIFF_LINES || midNewLen > MAX_DIFF_LINES) {
@@ -202,7 +248,7 @@ async function computeDiff(oldHashes, newLines) {
     const newMidLines = newLines.slice(prefix, n0 - suffix);
 
     const ops = lcsDiff(oldMid, newMidHashes, newMidLines, prefix);
-    return { ops, expectedHash };
+    return { ops, expectedHash, newHashes };
 }
 
 /**
@@ -271,13 +317,21 @@ async function attemptSyncOnce(cacheKey, chatFile, isGroupChat, newLines) {
         stateCache.set(cacheKey, state);
     }
 
-    const diff = await computeDiff(state.hashes, newLines);
+    const diff = await computeDiff(state.hashes, newLines, state);
     if (diff === null) {
         console.debug('[delta-sync] Diff window too large, using full-save');
         return { kind: 'fallback' };
     }
 
+    // Keep lines in cache even on no-op so the next edit can reuse hashes.
+    const cacheEntry = {
+        hashes: diff.newHashes,
+        fileHash: diff.expectedHash,
+        lines: newLines,
+    };
+
     if (diff.ops.length === 0) {
+        stateCache.set(cacheKey, cacheEntry);
         console.debug('[delta-sync] No changes detected, skipping save');
         return {
             kind: 'ok',
@@ -307,8 +361,7 @@ async function attemptSyncOnce(cacheKey, chatFile, isGroupChat, newLines) {
     });
 
     if (syncResp.ok) {
-        const newHashes = await Promise.all(newLines.map(l => hashLine(l)));
-        stateCache.set(cacheKey, { hashes: newHashes, fileHash: diff.expectedHash });
+        stateCache.set(cacheKey, cacheEntry);
         console.debug(`[delta-sync] Synced ${diff.ops.length} ops for ${chatFile}`);
         return {
             kind: 'ok',
@@ -373,9 +426,8 @@ async function tryFullSave(chatFile, isGroupChat, newLines, force) {
         });
 
         if (resp.ok) {
-            const newHashes = await Promise.all(newLines.map(l => hashLine(l)));
-            const newFileHash = await hashLines(newLines);
-            stateCache.set(cacheKey, { hashes: newHashes, fileHash: newFileHash });
+            const { hashes, fileHash } = await hashNewLines(newLines, cached);
+            stateCache.set(cacheKey, { hashes, fileHash, lines: newLines });
             console.debug(`[delta-sync] Full-save for ${chatFile}`);
             return new Response(JSON.stringify({ ok: true }), {
                 status: 200,
